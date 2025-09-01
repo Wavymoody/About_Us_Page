@@ -11,6 +11,7 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -22,16 +23,28 @@ public class Main {
     // ===== In-memory users (email -> User). Demo only. =====
     static final Map<String, User> USERS = new ConcurrentHashMap<>();
 
+    // ===== In-memory reset tokens (token -> email). Demo only. =====
+    static final Map<String, String> RESET_TOKENS = new ConcurrentHashMap<>();
+
     static final class User {
         final String name;
         final String email;
         final String passwordHash; // SHA-256 (base64)
+
         User(String name, String email, String passwordHash) {
             this.name = name; this.email = email; this.passwordHash = passwordHash;
+        }
+
+        User withPasswordHash(String newHash) {
+            return new User(this.name, this.email, newHash);
         }
     }
 
     public static void main(String[] args) throws IOException {
+        // Optional: seed a demo user so you can test password reset
+        USERS.putIfAbsent("edap_user@maxxenergy.com",
+                new User("EDAP Demo", "edap_user@maxxenergy.com", sha256("OldPassword123!")));
+
         int port = 8080;
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
 
@@ -45,8 +58,12 @@ public class Main {
         // Pretty About page (original)
         server.createContext("/about", new AboutHandler());
 
-        // Registration (new)
+        // Registration (existing)
         server.createContext("/register", new RegisterHandler());
+
+        // Password reset (new)
+        server.createContext("/password/forgot", new ForgotPasswordHandler());
+        server.createContext("/password/reset", new ResetPasswordHandler());
 
         // Serve everything under /assets/* from src/main/resources/static/*
         server.createContext("/assets", new StaticFileHandler("/static"));
@@ -59,10 +76,11 @@ public class Main {
         });
 
         System.out.println("Server running at http://localhost:" + port + "/about");
+        System.out.println("Demo user for reset: edap_user@maxxenergy.com (OldPassword123!)");
         server.start();
     }
 
-    /** === About page (kept from your original, with a Register link added in the nav) === */
+    /** === About page (with Register + Forgot Password links) === */
     static class AboutHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
@@ -79,6 +97,7 @@ public class Main {
                       --brand:#e22323; --brand2:#8b1111; --accent:#2dd4bf;
                     }
                     *{box-sizing:border-box}
+                    html{scroll-behavior:smooth}
                     body{margin:0;background:linear-gradient(180deg,#0b0c10 0%, #0e1117 100%);color:var(--ink);
                          font: 15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
                     a{color:inherit}
@@ -101,6 +120,7 @@ public class Main {
                     .btn.primary{background:linear-gradient(180deg,var(--brand),var(--brand2));border:0;color:white}
                     .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px}
                     section{padding:42px 0}
+                    #mission,#history,#team,#contact{scroll-margin-top:80px}
                     h2{font-size:26px;margin:0 0 10px}
                     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:24px}
                     @media (max-width:920px){.grid2{grid-template-columns:1fr}}
@@ -131,6 +151,7 @@ public class Main {
                         <a href="#history">History</a>
                         <a href="#team">Team</a>
                         <a href="/register">Register</a>
+                        <a href="/password/forgot">Forgot password?</a>
                         <a href="#contact">Contact</a>
                       </nav>
                     </div>
@@ -195,7 +216,7 @@ public class Main {
 
                     <section id="team">
                       <div class="cards">
-                        <div class="card>
+                        <div class="card">
                           <h3>Agile Coach / Scrum Master</h3>
                           <p class="muted">Leads planning, standups, and manages dependencies across DevOps, Data, Security.</p>
                         </div>
@@ -241,7 +262,7 @@ public class Main {
         @Override public void handle(HttpExchange ex) throws IOException {
             String method = ex.getRequestMethod();
             if ("GET".equalsIgnoreCase(method)) {
-                writeHtml(ex, 200, formHtml(null, null, null, null));
+                writeHtml(ex, 200, registerFormHtml(null, null, null, null));
                 return;
             }
             if ("POST".equalsIgnoreCase(method)) {
@@ -252,40 +273,143 @@ public class Main {
                 String email = trim(form.get("email"));
                 String password = trim(form.get("password"));
 
-                // validations
                 String err = null;
                 if (isEmpty(name) || isEmpty(email) || isEmpty(password)) {
                     err = "All fields are required.";
                 } else if (!isEmailish(email)) {
                     err = "Please enter a valid email.";
-                } else if (password.length() < 8) {
-                    err = "Password must be at least 8 characters.";
-                } else if (USERS.containsKey(email.toLowerCase())) {
-                    writeHtml(ex, 409, formHtml(name, email, "", "That email is already registered."));
-                    return;
+                } else {
+                    String pwdErr = passwordStrengthError(password);
+                    if (pwdErr != null) err = pwdErr;
                 }
 
                 if (err != null) {
-                    writeHtml(ex, 400, formHtml(name, email, "", err));
+                    writeHtml(ex, 400, registerFormHtml(name, email, "", err));
                     return;
                 }
 
-                // store user
-                String hash = sha256(password);
-                USERS.put(email.toLowerCase(), new User(name, email, hash));
+                String key = email.toLowerCase();
+                if (USERS.containsKey(key)) {
+                    writeHtml(ex, 409, registerFormHtml(name, email, "", "That email is already registered."));
+                    return;
+                }
 
-                writeHtml(ex, 201, successHtml(name, email));
+                String hash = sha256(password);
+                USERS.put(key, new User(name, email, hash));
+                writeHtml(ex, 201, successHtml(name, email, "Registration complete", "Back to About", "/about"));
                 return;
             }
 
-            // Method not allowed
             ex.getResponseHeaders().add("Allow", "GET, POST");
             ex.sendResponseHeaders(405, -1);
         }
     }
 
-    // ---------- HTML templates (no .formatted — safe with % in CSS) ----------
-    private static String formHtml(String name, String email, String password, String error) {
+    /** === Forgot Password: GET shows email form, POST “sends” reset link === */
+    static class ForgotPasswordHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            if ("GET".equalsIgnoreCase(method)) {
+                writeHtml(ex, 200, forgotFormHtml(null, null));
+                return;
+            }
+            if ("POST".equalsIgnoreCase(method)) {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                Map<String,String> form = parseUrlEncoded(body);
+                String email = trim(form.get("email"));
+                String normalized = email == null ? null : email.toLowerCase();
+
+                if (!isEmailish(email)) {
+                    writeHtml(ex, 400, forgotFormHtml(email, "Please enter a valid email."));
+                    return;
+                }
+
+                if (normalized != null && USERS.containsKey(normalized)) {
+                    String token = generateToken();
+                    RESET_TOKENS.put(token, normalized);
+                    String link = "http://localhost:8080/password/reset?token=" + urlEncode(token);
+                    // “Send” email by printing to server console for this demo
+                    System.out.println("=== Password reset link for " + email + " ===");
+                    System.out.println(link);
+                }
+
+                // Always show the same success message (avoid user enumeration)
+                writeHtml(ex, 200, infoHtml(
+                        "Check your email",
+                        "If an account exists for " + escape(email) + ", a password reset link has been sent.",
+                        "Back to About", "/about"));
+                return;
+            }
+
+            ex.getResponseHeaders().add("Allow", "GET, POST");
+            ex.sendResponseHeaders(405, -1);
+        }
+    }
+
+    /** === Reset Password: GET shows form if token is valid, POST sets new password === */
+    static class ResetPasswordHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            String rawQuery = ex.getRequestURI().getRawQuery();
+            String token = getQueryParam(rawQuery, "token");
+
+            if (token == null || !RESET_TOKENS.containsKey(token)) {
+                writeHtml(ex, 400, infoHtml("Invalid or expired link",
+                        "Your password reset link is invalid or has expired. Please request a new one.",
+                        "Request new link", "/password/forgot"));
+                return;
+            }
+
+            String email = RESET_TOKENS.get(token);
+
+            if ("GET".equalsIgnoreCase(method)) {
+                writeHtml(ex, 200, resetFormHtml(token, null));
+                return;
+            }
+
+            if ("POST".equalsIgnoreCase(method)) {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                Map<String,String> form = parseUrlEncoded(body);
+                String newPwd = trim(form.get("password"));
+                String confirm = trim(form.get("confirm"));
+
+                String err = null;
+                if (isEmpty(newPwd) || isEmpty(confirm)) {
+                    err = "Both password fields are required.";
+                } else if (!Objects.equals(newPwd, confirm)) {
+                    err = "Passwords do not match.";
+                } else {
+                    String pwdErr = passwordStrengthError(newPwd);
+                    if (pwdErr != null) err = pwdErr;
+                }
+
+                if (err != null) {
+                    writeHtml(ex, 400, resetFormHtml(token, err));
+                    return;
+                }
+
+                // Update user password
+                String key = email.toLowerCase();
+                User u = USERS.get(key);
+                if (u != null) {
+                    USERS.put(key, u.withPasswordHash(sha256(newPwd)));
+                }
+                // Invalidate token
+                RESET_TOKENS.remove(token);
+
+                writeHtml(ex, 200, successHtml(email, email,
+                        "Password updated",
+                        "Back to About", "/about"));
+                return;
+            }
+
+            ex.getResponseHeaders().add("Allow", "GET, POST");
+            ex.sendResponseHeaders(405, -1);
+        }
+    }
+
+    // ---------- HTML templates ----------
+    private static String registerFormHtml(String name, String email, String password, String error) {
         String html = """
         <!doctype html>
         <html lang="en"><head>
@@ -300,11 +424,12 @@ public class Main {
             h1{margin:0 0 10px}
             label{display:block;margin:12px 0 6px}
             input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid var(--line);background:#0d1017;color:var(--ink)}
-            .actions{margin-top:16px;display:flex;gap:10px}
+            .actions{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
             .btn{padding:12px 16px;border-radius:14px;border:1px solid var(--line);text-decoration:none;color:var(--ink)}
             .btn.primary{background:linear-gradient(180deg,var(--brand),var(--brand2));border:0;color:white}
             .muted{color:var(--muted)}
             .error{background:#2a0f12;border:1px solid #522;color:#f8caca;padding:10px;border-radius:12px;margin:10px 0}
+            .hint{margin-top:10px;color:var(--muted);font-size:13px}
           </style>
         </head><body>
           <div class="wrap">
@@ -321,10 +446,12 @@ public class Main {
 
                 <label for="password">Password</label>
                 <input id="password" type="password" name="password" value="{{PASSWORD}}" minlength="8" required />
+                <div class="hint">Use 8+ characters with upper, lower, number, and symbol.</div>
 
                 <div class="actions">
                   <button class="btn primary" type="submit">Create account</button>
                   <a class="btn" href="/about">Cancel</a>
+                  <a class="btn" href="/password/forgot">Forgot password?</a>
                 </div>
               </form>
             </div>
@@ -338,11 +465,96 @@ public class Main {
         return html;
     }
 
-    private static String successHtml(String name, String email) {
+    private static String forgotFormHtml(String email, String error) {
+        String html = """
+        <!doctype html><html lang="en"><head>
+          <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+          <title>Reset your password</title>
+          <style>
+            :root{--bg:#0b0c10; --card:#111217; --ink:#e8eaf0; --muted:#99a1b3; --line:#1f2330; --brand:#e22323; --brand2:#8b1111;}
+            body{margin:0;background:linear-gradient(180deg,#0b0c10,#0e1117);color:var(--ink);
+                 font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+            .wrap{max-width:520px;margin:48px auto;padding:0 18px}
+            .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
+            label{display:block;margin:12px 0 6px}
+            input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid var(--line);background:#0d1017;color:var(--ink)}
+            .btn{padding:12px 16px;border-radius:14px;border:1px solid var(--line);text-decoration:none;color:var(--ink)}
+            .btn.primary{background:linear-gradient(180deg,var(--brand),var(--brand2));border:0;color:white}
+            .error{background:#2a0f12;border:1px solid #522;color:#f8caca;padding:10px;border-radius:12px;margin:10px 0}
+            .actions{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+          </style></head><body>
+          <div class="wrap">
+            <div class="card">
+              <h1>Forgot your password?</h1>
+              <p class="muted">Enter your email and we'll send you a reset link.</p>
+              {{ERROR}}
+              <form method="POST" action="/password/forgot">
+                <label for="email">Email</label>
+                <input id="email" type="email" name="email" value="{{EMAIL}}" required />
+                <div class="actions">
+                  <button class="btn primary" type="submit">Send reset link</button>
+                  <a class="btn" href="/about">Cancel</a>
+                </div>
+              </form>
+            </div>
+          </div>
+        </body></html>
+        """;
+        html = html.replace("{{ERROR}}", error != null ? "<div class=\"error\">" + escape(error) + "</div>" : "");
+        html = html.replace("{{EMAIL}}", escapeOrEmpty(email));
+        return html;
+    }
+
+    private static String resetFormHtml(String token, String error) {
+        String html = """
+        <!doctype html><html lang="en"><head>
+          <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+          <title>Set a new password</title>
+          <style>
+            :root{--bg:#0b0c10; --card:#111217; --ink:#e8eaf0; --muted:#99a1b3; --line:#1f2330; --brand:#22c55e; --brand2:#15803d;}
+            body{margin:0;background:linear-gradient(180deg,#0b0c10,#0e1117);color:var(--ink);
+                 font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+            .wrap{max-width:520px;margin:48px auto;padding:0 18px}
+            .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
+            label{display:block;margin:12px 0 6px}
+            input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid var(--line);background:#0d1017;color:var(--ink)}
+            .btn{padding:12px 16px;border-radius:14px;border:1px solid var(--line);text-decoration:none;color:var(--ink)}
+            .btn.primary{background:linear-gradient(180deg,var(--brand),var(--brand2));border:0;color:white}
+            .error{background:#2a0f12;border:1px solid #522;color:#f8caca;padding:10px;border-radius:12px;margin:10px 0}
+            .hint{margin-top:10px;color:var(--muted);font-size:13px}
+            .actions{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+          </style></head><body>
+          <div class="wrap">
+            <div class="card">
+              <h1>Set a new password</h1>
+              {{ERROR}}
+              <form method="POST" action="/password/reset?token={{TOKEN}}">
+                <label for="password">New password</label>
+                <input id="password" type="password" name="password" minlength="8" required />
+                <div class="hint">Use 8+ characters with upper, lower, number, and symbol.</div>
+
+                <label for="confirm">Confirm new password</label>
+                <input id="confirm" type="password" name="confirm" minlength="8" required />
+
+                <div class="actions">
+                  <button class="btn primary" type="submit">Update password</button>
+                  <a class="btn" href="/about">Cancel</a>
+                </div>
+              </form>
+            </div>
+          </div>
+        </body></html>
+        """;
+        html = html.replace("{{ERROR}}", error != null ? "<div class=\"error\">" + escape(error) + "</div>" : "");
+        html = html.replace("{{TOKEN}}", escapeOrEmpty(token));
+        return html;
+    }
+
+    private static String successHtml(String name, String email, String title, String ctaText, String ctaHref) {
         String html = """
         <!doctype html><html lang="en"><head>
         <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>Registration complete</title>
+        <title>Success</title>
         <style>
           body{margin:0;background:#0e1117;color:#e8eaf0;font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
           .wrap{max-width:720px;margin:40px auto;padding:0 16px}
@@ -352,16 +564,47 @@ public class Main {
         </style></head><body>
         <div class="wrap">
           <div class="card">
-            <h2>You're registered 🎉</h2>
-            <p>Thanks, {{NAME}}. Your account <strong>{{EMAIL}}</strong> has been created.</p>
-            <p>Next step (later): sign in to access member-only features.</p>
-            <a class="btn" href="/about">Back to About</a>
+            <h2>{{TITLE}}</h2>
+            <p>{{BODY1}}</p>
+            <a class="btn" href="{{HREF}}">{{CTA}}</a>
           </div>
         </div>
         </body></html>
         """;
-        html = html.replace("{{NAME}}", escapeOrEmpty(name));
-        html = html.replace("{{EMAIL}}", escapeOrEmpty(email));
+        String body = "Thanks, " + escapeOrEmpty(name) + ". Your account <strong>" + escapeOrEmpty(email) + "</strong> has been updated.";
+        html = html.replace("{{TITLE}}", escapeOrEmpty(title));
+        html = html.replace("{{BODY1}}", body);
+        html = html.replace("{{CTA}}", escapeOrEmpty(ctaText));
+        html = html.replace("{{HREF}}", escapeOrEmpty(ctaHref));
+        return html;
+    }
+
+    private static String infoHtml(String title, String message, String ctaText, String ctaHref) {
+        String html = """
+        <!doctype html><html lang="en"><head>
+        <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+        <title>{{TITLE}}</title>
+        <style>
+          body{margin:0;background:#0e1117;color:#e8eaf0;font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+          .wrap{max-width:720px;margin:40px auto;padding:0 16px}
+          .card{background:#111217;border:1px solid #1f2330;border-radius:16px;padding:22px}
+          a.btn{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:12px;border:1px solid #1f2330;color:#e8eaf0;text-decoration:none}
+          a.btn:hover{background:#1a1f2b}
+          .muted{color:#99a1b3}
+        </style></head><body>
+        <div class="wrap">
+          <div class="card">
+            <h2>{{TITLE}}</h2>
+            <p class="muted">{{MSG}}</p>
+            <a class="btn" href="{{HREF}}">{{CTA}}</a>
+          </div>
+        </div>
+        </body></html>
+        """;
+        html = html.replace("{{TITLE}}", escapeOrEmpty(title));
+        html = html.replace("{{MSG}}", escapeOrEmpty(message));
+        html = html.replace("{{CTA}}", escapeOrEmpty(ctaText));
+        html = html.replace("{{HREF}}", escapeOrEmpty(ctaHref));
         return html;
     }
 
@@ -397,6 +640,7 @@ public class Main {
             if (p.endsWith(".css")) return "text/css; charset=utf-8";
             if (p.endsWith(".js"))  return "application/javascript; charset=utf-8";
             if (p.endsWith(".html"))return "text/html; charset=utf-8";
+            if (p.endsWith(".mp4")) return "video/mp4";
             return "application/octet-stream";
         }
     }
@@ -422,6 +666,7 @@ public class Main {
     }
 
     static String urlDecode(String s) { return URLDecoder.decode(s, StandardCharsets.UTF_8); }
+    static String urlEncode(String s) { return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8); }
     static boolean isEmpty(String s) { return s == null || s.isBlank(); }
     static String trim(String s) { return s == null ? null : s.trim(); }
 
@@ -429,6 +674,22 @@ public class Main {
         if (email == null) return false;
         String e = email.trim();
         return e.contains("@") && e.contains(".") && e.length() >= 6;
+    }
+
+    /** Simple strength rule: >=8, upper, lower, digit, symbol. Returns error message or null if OK. */
+    static String passwordStrengthError(String s) {
+        if (s == null || s.length() < 8) return "Password must be at least 8 characters.";
+        boolean upper=false, lower=false, digit=false, symbol=false;
+        for (char c: s.toCharArray()) {
+            if (Character.isUpperCase(c)) upper = true;
+            else if (Character.isLowerCase(c)) lower = true;
+            else if (Character.isDigit(c)) digit = true;
+            else symbol = true;
+        }
+        if (!upper || !lower || !digit || !symbol) {
+            return "Use upper, lower, number, and symbol in your password.";
+        }
+        return null;
     }
 
     static String sha256(String s) {
@@ -445,5 +706,21 @@ public class Main {
     static String escape(String s) {
         return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
                 .replace("\"","&quot;").replace("'","&#39;");
+    }
+
+    static String getQueryParam(String rawQuery, String key) {
+        if (rawQuery == null || rawQuery.isEmpty()) return null;
+        String[] pairs = rawQuery.split("&");
+        for (String p : pairs) {
+            String[] kv = p.split("=", 2);
+            if (kv.length == 2 && urlDecode(kv[0]).equals(key)) return urlDecode(kv[1]);
+        }
+        return null;
+    }
+
+    static String generateToken() {
+        byte[] b = new byte[32];
+        new SecureRandom().nextBytes(b);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(b);
     }
 }
