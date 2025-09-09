@@ -26,6 +26,11 @@ public class Main {
     // ===== In-memory reset tokens (token -> email). Demo only. =====
     static final Map<String, String> RESET_TOKENS = new ConcurrentHashMap<>();
 
+    // ===== In-memory sessions (sessionToken -> email). Demo only. =====
+    static final Map<String, String> SESSIONS = new ConcurrentHashMap<>();
+
+    static final String SESSION_COOKIE = "edap_session";
+
     static final class User {
         final String name;
         final String email;
@@ -41,7 +46,7 @@ public class Main {
     }
 
     public static void main(String[] args) throws IOException {
-        // Optional: seed a demo user so you can test password reset
+        // Optional: seed a demo user so you can test quickly
         USERS.putIfAbsent("edap_user@maxxenergy.com",
                 new User("EDAP Demo", "edap_user@maxxenergy.com", sha256("OldPassword123!")));
 
@@ -55,17 +60,24 @@ public class Main {
             exchange.close();
         });
 
-        // Pretty About page (original)
+        // Pretty About page
         server.createContext("/about", new AboutHandler());
 
-        // Registration (existing)
+        // Registration
         server.createContext("/register", new RegisterHandler());
 
-        // Password reset (new)
+        // Login/Logout
+        server.createContext("/login", new LoginHandler());
+        server.createContext("/logout", new LogoutHandler());
+
+        // Protected members area
+        server.createContext("/members", new MembersHandler());
+
+        // Password reset
         server.createContext("/password/forgot", new ForgotPasswordHandler());
         server.createContext("/password/reset", new ResetPasswordHandler());
 
-        // Serve everything under /assets/* from src/main/resources/static/*
+        // Static assets under /assets/* from /static resources
         server.createContext("/assets", new StaticFileHandler("/static"));
 
         // Optional health check
@@ -76,14 +88,18 @@ public class Main {
         });
 
         System.out.println("Server running at http://localhost:" + port + "/about");
-        System.out.println("Demo user for reset: edap_user@maxxenergy.com (OldPassword123!)");
+        System.out.println("Demo user for reset/login: edap_user@maxxenergy.com  /  OldPassword123!");
         server.start();
     }
 
-    /** === About page (with Register + Forgot Password links) === */
+    /** === About page (with Register/Login/Member links) === */
     static class AboutHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
+            String who = authedEmail(exchange); // null if not logged in
+            String status = (who == null)
+                    ? "<a class=\"btn\" href=\"/login\">Log in</a> <a class=\"btn\" href=\"/register\">Register</a>"
+                    : "<span class=\"muted\">Signed in as " + escape(who) + "</span> <a class=\"btn\" href=\"/members\">Members</a> <a class=\"btn\" href=\"/logout\">Log out</a>";
             String html = """
                 <!doctype html>
                 <html lang="en">
@@ -167,7 +183,8 @@ public class Main {
                         </p>
                         <div class="cta">
                           <a class="btn primary" href="/register">Create your account</a>
-                          <a class="btn" href="#mission">Our mission</a>
+                          <a class="btn" href="/members">Members area</a>
+                          {{AUTH_STATUS}}
                         </div>
                       </div>
                       <div class="logo-hero panel">
@@ -185,7 +202,7 @@ public class Main {
                           <div>
                             <ul>
                               <li>Public data viewable without login</li>
-                              <li>Private data secured with authentication & role-based authorization (executive, director, manager, staff)</li>
+                              <li>Private data secured with authentication & role-based authorization</li>
                               <li>Clear visualizations with filters and drilldowns</li>
                               <li>Well-defined APIs between Application, Data, and Security</li>
                             </ul>
@@ -248,7 +265,7 @@ public class Main {
                   <footer>© 2025 MAXX Energy · Enterprise Data Access Portal</footer>
                 </body>
                 </html>
-                """;
+                """.replace("{{AUTH_STATUS}}", status);
 
             byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
@@ -284,24 +301,156 @@ public class Main {
                 }
 
                 if (err != null) {
+                    System.out.println("[REGISTER] ERROR: " + err + " (" + email + ")");
                     writeHtml(ex, 400, registerFormHtml(name, email, "", err));
                     return;
                 }
 
                 String key = email.toLowerCase();
                 if (USERS.containsKey(key)) {
+                    System.out.println("[REGISTER] ERROR: Duplicate email (" + email + ")");
                     writeHtml(ex, 409, registerFormHtml(name, email, "", "That email is already registered."));
                     return;
                 }
 
                 String hash = sha256(password);
                 USERS.put(key, new User(name, email, hash));
-                writeHtml(ex, 201, successHtml(name, email, "Registration complete", "Back to About", "/about"));
+                System.out.println("[REGISTER] OK: " + email);
+                // After registration, suggest login
+                writeHtml(ex, 201, successHtml(name, email,
+                        "Registration complete",
+                        "Go to login", "/login"));
                 return;
             }
 
             ex.getResponseHeaders().add("Allow", "GET, POST");
             ex.sendResponseHeaders(405, -1);
+        }
+    }
+
+    /** === Login page + POST (creates session cookie) === */
+    static class LoginHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+
+            if ("GET".equalsIgnoreCase(method)) {
+                // If already logged in, go straight to members
+                if (authedEmail(ex) != null) {
+                    redirect(ex, "/members");
+                    return;
+                }
+                writeHtml(ex, 200, loginFormHtml(null, null, null));
+                return;
+            }
+
+            if ("POST".equalsIgnoreCase(method)) {
+                String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                Map<String,String> form = parseUrlEncoded(body);
+                String email = trim(form.get("email"));
+                String pwd = trim(form.get("password"));
+
+                if (isEmpty(email) || isEmpty(pwd)) {
+                    writeHtml(ex, 400, loginFormHtml(email, "", "Both fields are required."));
+                    return;
+                }
+                User u = USERS.get(email.toLowerCase());
+                if (u == null || !Objects.equals(u.passwordHash, sha256(pwd))) {
+                    writeHtml(ex, 401, loginFormHtml(email, "", "Invalid email or password."));
+                    return;
+                }
+
+                // Create a session
+                String token = generateToken();
+                SESSIONS.put(token, u.email.toLowerCase());
+                setSessionCookie(ex, token, 60 * 60 * 8); // 8 hours
+
+                System.out.println("[LOGIN] OK: " + email);
+                // Redirect to members area
+                ex.getResponseHeaders().add("Location", "/members");
+                ex.sendResponseHeaders(302, -1);
+                ex.close();
+                return;
+            }
+
+            ex.getResponseHeaders().add("Allow", "GET, POST");
+            ex.sendResponseHeaders(405, -1);
+        }
+    }
+
+    /** === Logout: clear session & cookie, then redirect === */
+    static class LogoutHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String token = sessionTokenFromCookie(ex);
+            if (token != null) {
+                SESSIONS.remove(token);
+            }
+            clearSessionCookie(ex);
+            redirect(ex, "/about");
+        }
+    }
+
+    /** === Members page (protected) === */
+    static class MembersHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String email = authedEmail(ex);
+            if (email == null) {
+                // Not authenticated → redirect to login
+                redirect(ex, "/login");
+                return;
+            }
+
+            // Example "member-only features": show user name/email + links
+            User u = USERS.get(email.toLowerCase());
+            String name = (u != null ? u.name : email);
+
+            String html = """
+            <!doctype html><html lang="en"><head>
+              <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+              <title>Members · EDAP</title>
+              <style>
+                :root{--bg:#0b0c10; --card:#111217; --ink:#e8eaf0; --muted:#99a1b3; --line:#1f2330; --brand:#2dd4bf;}
+                body{margin:0;background:linear-gradient(180deg,#0b0c10,#0e1117);color:var(--ink);
+                     font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+                .wrap{max-width:900px;margin:48px auto;padding:0 18px}
+                .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
+                h1{margin:0 0 10px}
+                .muted{color:var(--muted)}
+                .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:12px}
+                @media (max-width:920px){.grid{grid-template-columns:1fr}}
+                a.btn{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:12px;border:1px solid var(--line);color:var(--ink);text-decoration:none}
+                a.btn:hover{background:#1a1f2b}
+                ul{margin:8px 0 0 20px}
+              </style></head><body>
+              <div class="wrap">
+                <div class="card">
+                  <h1>Welcome, {{NAME}}!</h1>
+                  <p class="muted">You are signed in as <strong>{{EMAIL}}</strong>. This page is only visible to authenticated members.</p>
+                  <div class="grid">
+                    <div>
+                      <h3>Member-only widgets</h3>
+                      <ul>
+                        <li>Private energy KPIs</li>
+                        <li>Revenue drilldowns</li>
+                        <li>Download CSVs</li>
+                      </ul>
+                      <a class="btn" href="/about">Back to About</a>
+                      <a class="btn" href="/logout">Log out</a>
+                    </div>
+                    <div class="card">
+                      <h3>Account</h3>
+                      <ul>
+                        <li>Name: {{NAME}}</li>
+                        <li>Email: {{EMAIL}}</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </body></html>
+            """.replace("{{NAME}}", escapeOrEmpty(name))
+                    .replace("{{EMAIL}}", escapeOrEmpty(email));
+
+            writeHtml(ex, 200, html);
         }
     }
 
@@ -399,7 +548,7 @@ public class Main {
 
                 writeHtml(ex, 200, successHtml(email, email,
                         "Password updated",
-                        "Back to About", "/about"));
+                        "Go to login", "/login"));
                 return;
             }
 
@@ -437,15 +586,19 @@ public class Main {
               <h1>Create your account</h1>
               <p class="muted">Access member-only features with a free account.</p>
               {{ERROR}}
-              <form method="POST" action="/register">
+              <form method="POST" action="/register" autocomplete="on">
                 <label for="name">Full name</label>
-                <input id="name" name="name" value="{{NAME}}" required />
+                <input id="name" name="name" value="{{NAME}}" required autocomplete="name" />
 
                 <label for="email">Email</label>
-                <input id="email" type="email" name="email" value="{{EMAIL}}" required />
+                <input id="email" type="email" name="email" value="{{EMAIL}}" required autocomplete="email" />
 
                 <label for="password">Password</label>
-                <input id="password" type="password" name="password" value="{{PASSWORD}}" minlength="8" required />
+                <input id="password" type="password" name="password" value="{{PASSWORD}}" minlength="8" required
+                  autocomplete="new-password"
+                  pattern="(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[^A-Za-z\\d]).{8,}"
+                  title="8+ chars with upper, lower, number, and symbol"
+                />
                 <div class="hint">Use 8+ characters with upper, lower, number, and symbol.</div>
 
                 <div class="actions">
@@ -460,6 +613,53 @@ public class Main {
         """;
         html = html.replace("{{ERROR}}", error != null ? "<div class=\"error\">" + escape(error) + "</div>" : "");
         html = html.replace("{{NAME}}", escapeOrEmpty(name));
+        html = html.replace("{{EMAIL}}", escapeOrEmpty(email));
+        html = html.replace("{{PASSWORD}}", escapeOrEmpty(password));
+        return html;
+    }
+
+    private static String loginFormHtml(String email, String password, String error) {
+        String html = """
+        <!doctype html><html lang="en"><head>
+          <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+          <title>Log in · EDAP</title>
+          <style>
+            :root{--bg:#0b0c10; --card:#111217; --ink:#e8eaf0; --muted:#99a1b3; --line:#1f2330; --brand:#2dd4bf;}
+            body{margin:0;background:linear-gradient(180deg,#0b0c10,#0e1117);color:var(--ink);
+                 font:15px/1.55 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+            .wrap{max-width:520px;margin:48px auto;padding:0 18px}
+            .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
+            label{display:block;margin:12px 0 6px}
+            input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid var(--line);background:#0d1017;color:var(--ink)}
+            .btn{padding:12px 16px;border-radius:14px;border:1px solid var(--line);text-decoration:none;color:var(--ink)}
+            .btn.primary{background:linear-gradient(180deg,var(--brand),#18978f);border:0;color:white}
+            .error{background:#2a0f12;border:1px solid #522;color:#f8caca;padding:10px;border-radius:12px;margin:10px 0}
+            .actions{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
+            .muted{color:var(--muted)}
+          </style></head><body>
+          <div class="wrap">
+            <div class="card">
+              <h1>Log in</h1>
+              <p class="muted">Use your email and password to access member-only features.</p>
+              {{ERROR}}
+              <form method="POST" action="/login" autocomplete="on">
+                <label for="email">Email</label>
+                <input id="email" type="email" name="email" value="{{EMAIL}}" required autocomplete="email" />
+
+                <label for="password">Password</label>
+                <input id="password" type="password" name="password" value="{{PASSWORD}}" required autocomplete="current-password" />
+
+                <div class="actions">
+                  <button class="btn primary" type="submit">Log in</button>
+                  <a class="btn" href="/password/forgot">Forgot password?</a>
+                  <a class="btn" href="/register">Create account</a>
+                </div>
+              </form>
+            </div>
+          </div>
+        </body></html>
+        """;
+        html = html.replace("{{ERROR}}", error != null ? "<div class=\"error\">" + escape(error) + "</div>" : "");
         html = html.replace("{{EMAIL}}", escapeOrEmpty(email));
         html = html.replace("{{PASSWORD}}", escapeOrEmpty(password));
         return html;
@@ -608,14 +808,14 @@ public class Main {
         return html;
     }
 
-    /** Static file handler for /assets/*  → loads from /static in classpath resources */
+    // ---------- Static files ----------
     static class StaticFileHandler implements HttpHandler {
         private final String resourceRoot; // e.g., "/static"
         StaticFileHandler(String resourceRoot) { this.resourceRoot = resourceRoot; }
 
         @Override public void handle(HttpExchange ex) throws IOException {
             String path = ex.getRequestURI().getPath().replaceFirst("^/assets", "");
-            if (path.isEmpty() || "/".equals(path)) path = "/index.html"; // not used, but safe default
+            if (path.isEmpty() || "/".equals(path)) path = "/index.html";
             String resourcePath = resourceRoot + path;
 
             try (InputStream is = Main.class.getResourceAsStream(resourcePath)) {
@@ -651,6 +851,12 @@ public class Main {
         ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
         ex.sendResponseHeaders(status, bytes.length);
         try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+    }
+
+    static void redirect(HttpExchange ex, String to) throws IOException {
+        ex.getResponseHeaders().add("Location", to);
+        ex.sendResponseHeaders(302, -1);
+        ex.close();
     }
 
     static Map<String,String> parseUrlEncoded(String body) {
@@ -706,6 +912,42 @@ public class Main {
     static String escape(String s) {
         return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
                 .replace("\"","&quot;").replace("'","&#39;");
+    }
+
+    // ------- sessions & cookies -------
+    static void setSessionCookie(HttpExchange ex, String token, int maxAgeSeconds) {
+        // Path=/ to send for all routes; HttpOnly prevents JS access; SameSite=Lax is fine for this demo
+        String cookie = SESSION_COOKIE + "=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + maxAgeSeconds;
+        ex.getResponseHeaders().add("Set-Cookie", cookie);
+    }
+
+    static void clearSessionCookie(HttpExchange ex) {
+        String cookie = SESSION_COOKIE + "=deleted; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+        ex.getResponseHeaders().add("Set-Cookie", cookie);
+    }
+
+    static String authedEmail(HttpExchange ex) {
+        String token = sessionTokenFromCookie(ex);
+        if (token == null) return null;
+        return SESSIONS.get(token);
+    }
+
+    static String sessionTokenFromCookie(HttpExchange ex) {
+        String cookieHeader = header(ex, "Cookie");
+        if (cookieHeader == null || cookieHeader.isEmpty()) return null;
+        String[] parts = cookieHeader.split(";");
+        for (String part : parts) {
+            String[] kv = part.trim().split("=", 2);
+            if (kv.length == 2 && kv[0].equals(SESSION_COOKIE)) {
+                return kv[1];
+            }
+        }
+        return null;
+    }
+
+    static String header(HttpExchange ex, String name) {
+        var vals = ex.getRequestHeaders().get(name);
+        return (vals == null || vals.isEmpty()) ? null : vals.get(0);
     }
 
     static String getQueryParam(String rawQuery, String key) {
